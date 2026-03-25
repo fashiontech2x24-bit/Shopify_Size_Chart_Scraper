@@ -94,6 +94,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 class ScrapeRequest(BaseModel):
     url: str
+    recipe: dict | None = None        # inline recipe, same shape as recipes.py entries
+    skip_browser: bool = False         # if True, don't fall through to browser layers
+    store_name: str | None = None      # for logging/response
 
     @field_validator("url")
     @classmethod
@@ -139,13 +142,13 @@ async def health():
 
 @app.post("/scrape", response_model=ScrapeResult)
 async def scrape(req: ScrapeRequest):
-    store = detect_store(req.url)
+    store = req.store_name or detect_store(req.url)
     browser = await _get_browser()
 
     async with _semaphore:
         try:
             df = await asyncio.wait_for(
-                scrape_url(req.url, browser=browser),
+                scrape_url(req.url, browser=browser, recipe=req.recipe, skip_browser=req.skip_browser),
                 timeout=SCRAPE_TIMEOUT,
             )
         except asyncio.TimeoutError:

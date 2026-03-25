@@ -47,7 +47,7 @@ def detect_store(url: str) -> str:
     return "unknown"
 
 
-async def scrape_url(url: str, browser=None) -> pd.DataFrame:
+async def scrape_url(url: str, browser=None, recipe: dict | None = None, skip_browser: bool = False) -> pd.DataFrame:
     """
     Scrape size chart from any product URL.
 
@@ -62,7 +62,7 @@ async def scrape_url(url: str, browser=None) -> pd.DataFrame:
     # Layer 0: Regex fast-scan (no browser, instant)
     # Works for stores that have a recipe in recipes.py
     try:
-        df, confidence = await try_regex_scan(url)
+        df, confidence = await try_regex_scan(url, recipe=recipe)
         if not df.empty and confidence >= 0.5:
             log.info("Regex scan succeeded (confidence: %.2f) — %s", confidence, url)
             return df
@@ -70,6 +70,11 @@ async def scrape_url(url: str, browser=None) -> pd.DataFrame:
             log.info("Regex scan low confidence (%.2f), trying browser...", confidence)
     except Exception as e:
         log.debug("Regex scan skipped: %s", e)
+
+    # If caller wants recipe-only mode, stop here
+    if skip_browser:
+        log.info("skip_browser=True — not falling through to browser layers")
+        return pd.DataFrame()
 
     # Layer 1: Known store scraper
     if store in STORE_SCRAPERS:

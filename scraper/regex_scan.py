@@ -34,14 +34,15 @@ def find_recipe(url: str) -> dict | None:
     return None
 
 
-async def try_regex_scan(url: str) -> tuple[pd.DataFrame, float]:
+async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataFrame, float]:
     """
     Try to extract a size chart using regex (no browser).
 
     Returns (DataFrame, confidence) or (empty DataFrame, 0.0).
-    Only works for stores that have a recipe in recipes.py.
+    Works with an inline recipe (passed directly) or a stored recipe from recipes.py.
     """
-    recipe = find_recipe(url)
+    if recipe is None:
+        recipe = find_recipe(url)
     if not recipe:
         return pd.DataFrame(), 0.0
 
