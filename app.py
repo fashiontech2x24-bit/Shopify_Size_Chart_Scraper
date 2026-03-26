@@ -178,12 +178,25 @@ async def scrape(req: ScrapeRequest):
 
     df = df.fillna("")
     records = df.to_dict(orient="records")
+
+    # Extract product name — use Product column if clean, else fallback to URL slug
+    product = records[0].get("Product", "") if records else ""
+    if not product or len(product) > 300:
+        # Product field is missing or contains raw HTML — derive from URL
+        if "/products/" in req.url:
+            product = req.url.split("/products/")[-1].split("?")[0].replace("-", " ").title()
+        else:
+            product = req.url.rstrip("/").split("/")[-1].replace("-", " ").title()
+
+    # Read unit from data if available, default to cm
+    unit = records[0].get("Unit", "cm") if records else "cm"
+
     return ScrapeResult(
         success=True,
         url=req.url,
         store=store,
-        product=records[0].get("Product", "") if records else None,
-        unit="cm",
+        product=product,
+        unit=unit,
         columns=list(df.columns),
         data=records,
     )

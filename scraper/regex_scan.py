@@ -1,7 +1,12 @@
 """
-Layer 0 — Regex fast-scan. Fetches raw HTML via HTTP and extracts
+Layer 0 — Universal recipe engine. Fetches raw HTML via HTTP and extracts
 size charts using store-specific recipes. No browser needed.
 
+Supports two parse modes controlled entirely by recipe config:
+  parse="regex" — HTML container → row regex → cell regex → DataFrame
+  parse="json"  — container regex captures JSON blobs → json.loads → DataFrame
+
+No code changes needed for new store formats — just add a recipe.
 Typical time: ~0.3–0.5 sec (vs 5–15 sec with browser).
 """
 
@@ -36,7 +41,7 @@ def find_recipe(url: str) -> dict | None:
 
 async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataFrame, float]:
     """
-    Try to extract a size chart using regex (no browser).
+    Try to extract a size chart using the universal recipe engine (no browser).
 
     Returns (DataFrame, confidence) or (empty DataFrame, 0.0).
     Works with an inline recipe (passed directly) or a stored recipe from recipes.py.
@@ -46,7 +51,7 @@ async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataF
     if not recipe:
         return pd.DataFrame(), 0.0
 
-    store_name = recipe["name"]
+    store_name = recipe.get("name", "unknown")
     log.info("[regex] Recipe found: %s — fetching HTML...", store_name)
 
     # Step 1: Fetch raw HTML via HTTP
@@ -68,21 +73,13 @@ async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataF
     title = _extract_title(html, url, store_name)
     log.info("[regex] Product: %s", title)
 
-    # Step 4: Apply recipe to extract size chart
-    fmt = recipe.get("format", "regex")
-
-    if fmt == "jotly_json":
-        df = _extract_jotly_json(html, recipe, title)
-    else:
-        rows = _apply_recipe(html, recipe)
-        if not rows:
-            log.info("[regex] Recipe matched no data")
-            return pd.DataFrame(), 0.0
-        df = _build_dataframe(rows, recipe, title)
+    # Step 4: Apply universal recipe
+    df = _apply_universal_recipe(html, recipe, title)
     if df.empty:
+        log.info("[regex] Recipe matched no data")
         return pd.DataFrame(), 0.0
 
-    # Step 6: Compute confidence
+    # Step 5: Compute confidence
     confidence = _compute_confidence(df)
     log.info("[regex] Extracted %d sizes, confidence: %.2f", len(df), confidence)
 
@@ -102,51 +99,168 @@ async def _fetch_html(url: str) -> str | None:
         return None
 
 
-def _extract_jotly_json(html: str, recipe: dict, title: str) -> pd.DataFrame:
+def _apply_universal_recipe(html: str, recipe: dict, title: str) -> pd.DataFrame:
     """
-    Extract size chart from Jotly size chart app JSON embedded in HTML.
+    Universal recipe engine — one function handles all store formats.
 
-    Jotly stores data as: "rows":[[...],[...]],"headers":[...]
-    Used by Shopify stores with the Jotly size chart extension.
+    Pipeline:
+      1. Container match (regex, first match wins if list)
+      2. Parse: "regex" → row/cell extraction, "json" → json.loads capture groups
+      3. Cell-key extraction (for nested objects like {"in":"32","cm":"82"})
+      4. Value formatting (plain, slash_cm, slash_inches)
+      5. Build DataFrame with Product + Unit columns
     """
-    # Pattern: "rows":[[row1],[row2],...],"headers":["Size","Chest",...]
-    # Also handle reversed order: "headers":[...],...,"rows":[[...]]
-    m = re.search(
-        r'"rows":\s*(\[\[.*?\]\])\s*,\s*"headers":\s*(\[[^\]]+\])',
-        html, re.DOTALL,
-    )
-    if not m:
-        # Try reversed order (headers before rows)
-        m = re.search(
-            r'"headers":\s*(\[[^\]]+\])\s*,.*?"rows":\s*(\[\[.*?\]\])',
-            html, re.DOTALL,
-        )
-        if m:
-            headers_str, rows_str = m.group(1), m.group(2)
-        else:
-            log.info("[regex] Jotly JSON pattern not found")
-            return pd.DataFrame()
+    # --- Step 1: Container match ---
+    containers = recipe["container"]
+    if isinstance(containers, str):
+        containers = [containers]
+
+    # Normalize json_rows/json_headers to lists aligned with containers
+    json_rows_list = recipe.get("json_rows", [1])
+    json_headers_list = recipe.get("json_headers", [2])
+    if isinstance(json_rows_list, int):
+        json_rows_list = [json_rows_list] * len(containers)
+    if isinstance(json_headers_list, int):
+        json_headers_list = [json_headers_list] * len(containers)
+
+    match = None
+    pattern_idx = 0
+    for i, pattern in enumerate(containers):
+        match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+        if match:
+            pattern_idx = i
+            break
+
+    if not match:
+        return pd.DataFrame()
+
+    # --- Step 2: Parse ---
+    parse_mode = recipe.get("parse", "regex")
+    fmt = recipe.get("value_format", "plain")
+    unit = recipe.get("unit", "cm")
+
+    if parse_mode == "json":
+        return _parse_json_mode(match, pattern_idx, json_rows_list, json_headers_list, recipe, fmt, unit, title)
     else:
-        rows_str, headers_str = m.group(1), m.group(2)
+        return _parse_regex_mode(match, recipe, fmt, unit, title)
+
+
+def _parse_regex_mode(match, recipe: dict, fmt: str, unit: str, title: str) -> pd.DataFrame:
+    """Parse using row/cell regex patterns (HTML tables, lists, etc.)."""
+    container_html = match.group(0)
+
+    # Find all rows inside the container
+    row_matches = re.findall(recipe["row"], container_html, re.DOTALL | re.IGNORECASE)
+    if not row_matches:
+        return pd.DataFrame()
+
+    # Extract cells from each row
+    rows = []
+    for row_html in row_matches:
+        cells = re.findall(recipe["cell"], row_html, re.DOTALL | re.IGNORECASE)
+        cleaned = [_TAG_STRIP.sub("", c).strip() for c in cells]
+        if any(cleaned):
+            rows.append(cleaned)
+
+    if not rows or len(rows) < 2:
+        return pd.DataFrame()
+
+    # Build DataFrame based on layout
+    layout = recipe.get("first_row", "headers")
+
+    if layout == "headers":
+        headers = rows[0]
+        data = []
+        for row in rows[1:]:
+            d = {}
+            for j, h in enumerate(headers):
+                val = row[j] if j < len(row) else ""
+                d[h] = _parse_value(val, fmt)
+            data.append(d)
+    elif layout == "sizes":
+        size_row = rows[0]
+        sizes = size_row[1:]
+        data = [{"Size": s} for s in sizes]
+        for meas_row in rows[1:]:
+            if not meas_row:
+                continue
+            measure_name = meas_row[0]
+            clean_name = re.sub(r"\s*\(.*?\)\s*$", "", measure_name).strip()
+            if not clean_name:
+                continue
+            values = meas_row[1:]
+            for i, size_dict in enumerate(data):
+                raw = values[i] if i < len(values) else ""
+                size_dict[clean_name] = _parse_value(raw, fmt)
+    else:
+        return pd.DataFrame()
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    df.insert(0, "Product", title)
+    df.insert(1, "Unit", unit)
+    return df
+
+
+def _parse_json_mode(match, pattern_idx: int, json_rows_list: list, json_headers_list: list,
+                     recipe: dict, fmt: str, unit: str, title: str) -> pd.DataFrame:
+    """Parse using JSON — extract capture groups, json.loads, build DataFrame."""
+    rows_group = json_rows_list[pattern_idx]
+    headers_group = json_headers_list[pattern_idx]
+
+    rows_str = match.group(rows_group)
+    headers_str = match.group(headers_group)
+
+    # Unescape if needed (for Next.js escaped JSON)
+    if recipe.get("unescape"):
+        rows_str = rows_str.replace('\\"', '"')
+        headers_str = headers_str.replace('\\"', '"')
 
     try:
         headers = json.loads(headers_str)
-        rows = json.loads(rows_str)
+        rows_data = json.loads(rows_str)
     except json.JSONDecodeError as e:
-        log.info("[regex] Jotly JSON parse error: %s", e)
+        log.info("[regex] JSON parse error: %s", e)
         return pd.DataFrame()
 
-    if not headers or not rows:
+    if not headers or not rows_data:
         return pd.DataFrame()
+
+    cell_key = recipe.get("cell_key")
+
+    # Normalize: array-of-objects → array-of-arrays
+    if rows_data and isinstance(rows_data[0], dict):
+        normalized = []
+        for row_obj in rows_data:
+            row_values = []
+            for h in headers:
+                val = row_obj.get(h, "")
+                if isinstance(val, dict) and cell_key:
+                    val = val.get(cell_key, "")
+                row_values.append(str(val))
+            normalized.append(row_values)
+        rows_data = normalized
+    else:
+        # Array-of-arrays — apply cell_key if cells are somehow objects (unlikely but safe)
+        normalized = []
+        for row in rows_data:
+            row_values = []
+            for val in row:
+                if isinstance(val, dict) and cell_key:
+                    val = val.get(cell_key, "")
+                row_values.append(str(val))
+            normalized.append(row_values)
+        rows_data = normalized
 
     # Build DataFrame
-    fmt = recipe.get("value_format", "plain")
     data = []
-    for row in rows:
+    for row in rows_data:
         d = {}
         for j, h in enumerate(headers):
             val = row[j] if j < len(row) else ""
-            d[h] = _parse_value(str(val), fmt)
+            d[h] = _parse_value(val, fmt)
         data.append(d)
 
     if not data:
@@ -154,7 +268,7 @@ def _extract_jotly_json(html: str, recipe: dict, title: str) -> pd.DataFrame:
 
     df = pd.DataFrame(data)
     df.insert(0, "Product", title)
-    df.insert(1, "Unit", "cm")
+    df.insert(1, "Unit", unit)
     return df
 
 
@@ -164,7 +278,6 @@ def _extract_title(html: str, url: str, brand_name: str) -> str:
     og = re.search(r'property="og:title"\s+content="([^"]*)"', html, re.IGNORECASE)
     if og:
         title = og.group(1).strip()
-        # Clean brand name suffix
         title = re.sub(
             rf"\s*[|–\-]\s*{re.escape(brand_name)}.*$", "", title, flags=re.IGNORECASE
         )
@@ -185,37 +298,6 @@ def _extract_title(html: str, url: str, brand_name: str) -> str:
     if "/products/" in url:
         return url.split("/products/")[-1].split("?")[0].replace("-", " ").title()
     return url.rstrip("/").split("/")[-1].replace("-", " ").title()
-
-
-def _apply_recipe(html: str, recipe: dict) -> list[list[str]]:
-    """
-    Apply a recipe's regex patterns to extract raw rows of cell values.
-
-    Returns a list of rows, where each row is a list of cleaned cell strings.
-    Example: [["US Size","XXS","XS","S"], ["Bust","30/76.2","32/81.3","34/86.4"]]
-    """
-    # Find the container
-    container_match = re.search(recipe["container"], html, re.DOTALL | re.IGNORECASE)
-    if not container_match:
-        return []
-
-    container_html = container_match.group(0)
-
-    # Find all rows inside the container
-    row_matches = re.findall(recipe["row"], container_html, re.DOTALL | re.IGNORECASE)
-    if not row_matches:
-        return []
-
-    # Extract cells from each row
-    rows = []
-    for row_html in row_matches:
-        cells = re.findall(recipe["cell"], row_html, re.DOTALL | re.IGNORECASE)
-        # Strip HTML tags and whitespace from each cell
-        cleaned = [_TAG_STRIP.sub("", c).strip() for c in cells]
-        if any(cleaned):  # skip empty rows
-            rows.append(cleaned)
-
-    return rows
 
 
 def _parse_value(raw: str, fmt: str) -> str:
@@ -239,80 +321,6 @@ def _parse_value(raw: str, fmt: str) -> str:
         return parts[0].strip() if len(parts) == 2 else raw
 
     return raw
-
-
-def _build_dataframe(rows: list[list[str]], recipe: dict, title: str) -> pd.DataFrame:
-    """
-    Build a DataFrame from extracted rows using the recipe's layout info.
-
-    first_row="headers":  Row 0 is column names, rows 1+ are data.
-        Size | Chest | Waist
-        S    | 96    | 76
-        M    | 100   | 80
-
-    first_row="sizes":  Row 0 is size labels, rows 1+ are measurements (transposed).
-        US Size | XXS   | XS    | S
-        Bust    | 30/76 | 32/81 | 34/86
-        Waist   | 24/61 | 26/66 | 28/71
-    """
-    fmt = recipe.get("value_format", "plain")
-    layout = recipe.get("first_row", "headers")
-
-    if not rows or len(rows) < 2:
-        return pd.DataFrame()
-
-    if layout == "headers":
-        # Standard table: first row = headers, rest = data rows
-        headers = rows[0]
-        data = []
-        for row in rows[1:]:
-            d = {}
-            for j, h in enumerate(headers):
-                val = row[j] if j < len(row) else ""
-                d[h] = _parse_value(val, fmt)
-            data.append(d)
-
-        if not data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data)
-        df.insert(0, "Product", title)
-        df.insert(1, "Unit", "cm")
-        return df
-
-    elif layout == "sizes":
-        # Transposed: first row = size labels, other rows = measurements
-        size_row = rows[0]
-        # First cell is the label (e.g., "US Size"), rest are actual sizes
-        size_label = size_row[0]
-        sizes = size_row[1:]
-
-        # Build one dict per size
-        data = [{"Size": s} for s in sizes]
-
-        for meas_row in rows[1:]:
-            if not meas_row:
-                continue
-            measure_name = meas_row[0]  # e.g., "Bust(inches/cm)"
-            # Clean measurement name: "Bust(inches/cm)" → "Bust"
-            clean_name = re.sub(r"\s*\(.*?\)\s*$", "", measure_name).strip()
-            if not clean_name:
-                continue
-
-            values = meas_row[1:]
-            for i, size_dict in enumerate(data):
-                raw = values[i] if i < len(values) else ""
-                size_dict[clean_name] = _parse_value(raw, fmt)
-
-        if not data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data)
-        df.insert(0, "Product", title)
-        df.insert(1, "Unit", "cm")
-        return df
-
-    return pd.DataFrame()
 
 
 def _compute_confidence(df: pd.DataFrame) -> float:

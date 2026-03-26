@@ -40,6 +40,7 @@ def detect_store(url: str) -> str:
         "theloom.in": "theloom",
         "outdoorvoices.com": "outdoorvoices",
         "goodamerican.com": "goodamerican",
+        "geneslecoanethemant.com": "geneslecoanethemant",
     }
     for domain, store in store_map.items():
         if domain in host:
