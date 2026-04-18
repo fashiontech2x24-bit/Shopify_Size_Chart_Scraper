@@ -10,6 +10,7 @@ No code changes needed for new store formats — just add a recipe.
 Typical time: ~0.3–0.5 sec (vs 5–15 sec with browser).
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -39,12 +40,19 @@ def find_recipe(url: str) -> dict | None:
     return None
 
 
-async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataFrame, float]:
+async def try_regex_scan(
+    url: str,
+    recipe: dict | None = None,
+    storefront_password: str | None = None,
+) -> tuple[pd.DataFrame, float]:
     """
     Try to extract a size chart using the universal recipe engine (no browser).
 
     Returns (DataFrame, confidence) or (empty DataFrame, 0.0).
     Works with an inline recipe (passed directly) or a stored recipe from recipes.py.
+
+    If `storefront_password` is given, first POST it to the Shopify /password
+    endpoint on the same origin to obtain a session cookie, then fetch with it.
     """
     if recipe is None:
         recipe = find_recipe(url)
@@ -54,8 +62,8 @@ async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataF
     store_name = recipe.get("name", "unknown")
     log.info("[regex] Recipe found: %s — fetching HTML...", store_name)
 
-    # Step 1: Fetch raw HTML via HTTP
-    html = await _fetch_html(url)
+    # Step 1: Fetch raw HTML via HTTP (optionally unlocking Shopify password wall)
+    html = await _fetch_html(url, storefront_password=storefront_password)
     if not html:
         log.info("[regex] HTTP fetch failed, skipping")
         return pd.DataFrame(), 0.0
@@ -86,16 +94,48 @@ async def try_regex_scan(url: str, recipe: dict | None = None) -> tuple[pd.DataF
     return df, confidence
 
 
-async def _fetch_html(url: str) -> str | None:
-    """Fetch raw HTML via aiohttp. Returns None on failure."""
+async def _fetch_html(url: str, storefront_password: str | None = None) -> str | None:
+    """
+    Fetch raw HTML via aiohttp. Returns None on failure (with logged reason).
+
+    If `storefront_password` is provided, POST it to `<origin>/password` inside
+    the same session first so the `_shopify_essential` cookie is present for
+    the subsequent GET. This unlocks password-protected Shopify preview stores.
+    """
     try:
         timeout = aiohttp.ClientTimeout(total=_FETCH_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            if storefront_password:
+                parsed = urlparse(url)
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+                try:
+                    async with session.post(
+                        f"{origin}/password",
+                        data={
+                            "form_type": "storefront_password",
+                            "utf8": "✓",
+                            "password": storefront_password,
+                        },
+                        headers=HEADERS,
+                        allow_redirects=True,
+                    ) as auth_resp:
+                        log.info("[regex] Storefront auth → HTTP %d", auth_resp.status)
+                except Exception as e:
+                    log.info("[regex] Storefront auth failed: %s", e)
+
             async with session.get(url, headers=HEADERS, allow_redirects=True) as resp:
                 if resp.status != 200:
+                    log.info("[regex] HTTP %d for %s", resp.status, url)
                     return None
                 return await resp.text()
-    except Exception:
+    except asyncio.TimeoutError:
+        log.info("[regex] HTTP fetch timeout (%ds) for %s", _FETCH_TIMEOUT, url)
+        return None
+    except aiohttp.ClientError as e:
+        log.info("[regex] HTTP fetch client error for %s: %s", url, e)
+        return None
+    except Exception as e:
+        log.warning("[regex] HTTP fetch unexpected error for %s: %s", url, e)
         return None
 
 
@@ -204,19 +244,38 @@ def _parse_regex_mode(match, recipe: dict, fmt: str, unit: str, title: str) -> p
     return df
 
 
+def _unescape_json(s: str) -> str:
+    """Unescape common escape sequences found in embedded JSON (Next.js, Shopify)."""
+    return (
+        s.replace('\\"', '"')
+         .replace("\\/", "/")
+         .replace("\\n", " ")
+         .replace("\\t", " ")
+    )
+
+
 def _parse_json_mode(match, pattern_idx: int, json_rows_list: list, json_headers_list: list,
                      recipe: dict, fmt: str, unit: str, title: str) -> pd.DataFrame:
     """Parse using JSON — extract capture groups, json.loads, build DataFrame."""
+    if pattern_idx >= len(json_rows_list) or pattern_idx >= len(json_headers_list):
+        log.info("[regex] Recipe misconfigured: json_rows/json_headers shorter than container list")
+        return pd.DataFrame()
+
     rows_group = json_rows_list[pattern_idx]
     headers_group = json_headers_list[pattern_idx]
 
-    rows_str = match.group(rows_group)
-    headers_str = match.group(headers_group)
+    try:
+        rows_str = match.group(rows_group)
+        headers_str = match.group(headers_group)
+    except IndexError as e:
+        log.info("[regex] Recipe misconfigured: capture group out of range in pattern %d (%s)",
+                 pattern_idx, e)
+        return pd.DataFrame()
 
-    # Unescape if needed (for Next.js escaped JSON)
+    # Unescape if needed (for Next.js / Shopify escaped JSON)
     if recipe.get("unescape"):
-        rows_str = rows_str.replace('\\"', '"')
-        headers_str = headers_str.replace('\\"', '"')
+        rows_str = _unescape_json(rows_str)
+        headers_str = _unescape_json(headers_str)
 
     try:
         headers = json.loads(headers_str)
@@ -330,9 +389,11 @@ def _compute_confidence(df: pd.DataFrame) -> float:
 
     score = 0.3  # base score — recipe matched
 
-    # Bonus: recognized measurement columns
-    cols_lower = {c.lower() for c in df.columns}
-    matched_measurements = cols_lower & MEASUREMENT_KEYWORDS
+    # Bonus: recognized measurement columns (substring match so "To Fit Bust" counts).
+    cols_lower = [c.lower() for c in df.columns]
+    matched_measurements = {
+        kw for kw in MEASUREMENT_KEYWORDS if any(kw in col for col in cols_lower)
+    }
     if matched_measurements:
         score += min(len(matched_measurements) * 0.1, 0.3)
 

@@ -106,11 +106,29 @@ def _inch_range_to_cm(val: str):
 async def get_product_title(page, url: str, brand_name: str = "") -> str:
     """Extract product title from page, with brand name cleanup."""
     title = await page.evaluate("""() => {
-        const el = document.querySelector('h1, [data-testid="product-title"], .product__title, [class*="product-title"], [class*="ProductTitle"]');
-        if (el) return el.textContent.trim();
-        let t = document.title || '';
-        return t.trim();
+        const selectors = [
+            '[data-testid="product-title"]',
+            '.product__title',
+            '[class*="product-title"]',
+            '[class*="ProductTitle"]',
+            'h1',
+        ];
+        for (const sel of selectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                if (el.offsetParent !== null && el.innerText.trim().length > 0) {
+                    return el.innerText.trim();
+                }
+            }
+        }
+        // Fallback: first h1 even if hidden, then document.title
+        const h1 = document.querySelector('h1');
+        if (h1 && h1.textContent.trim()) return h1.textContent.trim();
+        return (document.title || '').trim();
     }""")
+
+    # Collapse internal whitespace/newlines from textContent
+    if title:
+        title = re.sub(r'\s+', ' ', title).strip()
 
     if title and brand_name:
         # Clean brand name from title

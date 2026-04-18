@@ -9,7 +9,7 @@ Strategies (tried in order):
   5. Iframe detection — Kiwi Sizing and similar embedded widgets
 """
 
-from ..helpers import _wait_for, _click_and_wait
+from ..helpers import _wait_for
 
 # JS: find all clickable elements whose text matches size chart keywords
 FIND_TRIGGERS_JS = """() => {

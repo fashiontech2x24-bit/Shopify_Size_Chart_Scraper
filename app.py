@@ -6,16 +6,17 @@ Run:  uvicorn app:app --host 0.0.0.0 --port 8000
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 from scraper import scrape_url, detect_store
-from scraper.config import BROWSER_ARGS, MAX_PARALLEL
+from scraper.config import MAX_PARALLEL
 from scraper.helpers import launch_browser
 
 # ---------------------------------------------------------------------------
@@ -28,42 +29,69 @@ logging.basicConfig(
 log = logging.getLogger("scraper-service")
 
 # ---------------------------------------------------------------------------
-# Browser pool — single Chromium instance reused across all requests
+# Config from environment
 # ---------------------------------------------------------------------------
-SCRAPE_TIMEOUT = 60  # seconds per scrape
+SCRAPE_TIMEOUT = int(os.environ.get("SCRAPE_TIMEOUT", "60"))
+API_KEY = os.environ.get("API_KEY")  # if set, required via X-API-Key header
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+]
+
+# ---------------------------------------------------------------------------
+# Browser pool — single Chromium instance reused across all requests.
+# Semaphore is created at module load so it is never None at request time.
+# ---------------------------------------------------------------------------
 _browser = None
 _pw = None
 _start_time: float = 0
-_semaphore: asyncio.Semaphore | None = None
+_semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_PARALLEL)
+_restart_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _start_browser():
-    global _browser, _pw, _start_time, _semaphore
+    global _browser, _pw, _start_time
     _pw, _browser = await launch_browser()
     _start_time = time.time()
-    _semaphore = asyncio.Semaphore(MAX_PARALLEL)
     log.info("Browser started (max %d parallel scrapes)", MAX_PARALLEL)
 
 
 async def _stop_browser():
     global _browser, _pw
     if _browser:
-        await _browser.close()
+        try:
+            await _browser.close()
+        except Exception as e:
+            log.warning("Error closing browser: %s", e)
         _browser = None
     if _pw:
-        await _pw.stop()
+        try:
+            await _pw.stop()
+        except Exception as e:
+            log.warning("Error stopping playwright: %s", e)
         _pw = None
     log.info("Browser stopped")
 
 
 async def _get_browser():
-    """Return the shared browser, restarting if it crashed."""
+    """Return the shared browser, restarting if it crashed.
+
+    Guarded by a lock so concurrent callers don't stampede a restart.
+    """
     global _browser
-    if _browser is None or not _browser.is_connected():
-        log.warning("Browser not connected — restarting...")
-        await _stop_browser()
-        await _start_browser()
+    if _browser is not None and _browser.is_connected():
+        return _browser
+
+    async with _restart_lock:
+        # Re-check after acquiring the lock — another task may have restarted.
+        if _browser is None or not _browser.is_connected():
+            log.warning("Browser not connected — restarting...")
+            await _stop_browser()
+            await _start_browser()
     return _browser
+
+
+def _is_ready() -> bool:
+    return _browser is not None and _browser.is_connected()
 
 
 # ---------------------------------------------------------------------------
@@ -78,25 +106,33 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Size Chart Scraper",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _require_api_key(x_api_key: str | None) -> None:
+    """If API_KEY env var is set, require a matching X-API-Key header."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
 class ScrapeRequest(BaseModel):
     url: str
-    recipe: dict | None = None        # inline recipe, same shape as recipes.py entries
-    skip_browser: bool = False         # if True, don't fall through to browser layers
-    store_name: str | None = None      # for logging/response
+    recipe: dict | None = None
+    skip_browser: bool = False
+    store_name: str | None = None
+    storefront_password: str | None = None  # Shopify preview-store password
 
     @field_validator("url")
     @classmethod
@@ -131,24 +167,40 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    browser_status = "running" if _browser and _browser.is_connected() else "down"
+    ready = _is_ready()
     return HealthResponse(
-        status="ok" if browser_status == "running" else "degraded",
-        browser=browser_status,
+        status="ok" if ready else "degraded",
+        browser="running" if ready else "down",
         uptime_seconds=int(time.time() - _start_time) if _start_time else 0,
         max_parallel=MAX_PARALLEL,
     )
 
 
 @app.post("/scrape", response_model=ScrapeResult)
-async def scrape(req: ScrapeRequest):
-    store = req.store_name or detect_store(req.url)
-    browser = await _get_browser()
+async def scrape(req: ScrapeRequest, x_api_key: str | None = Header(default=None)):
+    _require_api_key(x_api_key)
 
+    store = req.store_name or detect_store(req.url)
+
+    # Acquire the concurrency slot FIRST, then get the browser. This ensures
+    # browser restarts are serialized under the global limit rather than
+    # stampeding when many requests arrive during a crash.
     async with _semaphore:
         try:
+            browser = await _get_browser()
+        except Exception as e:
+            log.exception("Failed to start browser")
+            raise HTTPException(status_code=503, detail=f"Browser unavailable: {e}")
+
+        try:
             df = await asyncio.wait_for(
-                scrape_url(req.url, browser=browser, recipe=req.recipe, skip_browser=req.skip_browser),
+                scrape_url(
+                    req.url,
+                    browser=browser,
+                    recipe=req.recipe,
+                    skip_browser=req.skip_browser,
+                    storefront_password=req.storefront_password,
+                ),
                 timeout=SCRAPE_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -179,16 +231,15 @@ async def scrape(req: ScrapeRequest):
     df = df.fillna("")
     records = df.to_dict(orient="records")
 
-    # Extract product name — use Product column if clean, else fallback to URL slug
     product = records[0].get("Product", "") if records else ""
     if not product or len(product) > 300:
-        # Product field is missing or contains raw HTML — derive from URL
+        if product:
+            log.warning("Product field looks malformed (len=%d); falling back to URL slug", len(product))
         if "/products/" in req.url:
             product = req.url.split("/products/")[-1].split("?")[0].replace("-", " ").title()
         else:
             product = req.url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
-    # Read unit from data if available, default to cm
     unit = records[0].get("Unit", "cm") if records else "cm"
 
     return ScrapeResult(

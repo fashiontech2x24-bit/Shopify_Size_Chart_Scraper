@@ -4,7 +4,7 @@ Normalization module — detect units, convert to CM, standardize columns.
 
 import re
 import pandas as pd
-from ..config import INCH_TO_CM, MEASUREMENT_KEYWORDS
+from ..config import MEASUREMENT_KEYWORDS
 from ..helpers import _inch_range_to_cm
 
 

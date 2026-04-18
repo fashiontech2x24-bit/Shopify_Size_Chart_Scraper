@@ -75,6 +75,20 @@ RECIPES = {
         "unit": "inches",
     },
 
+    # ── Tuck Demo (Shopify) ───────────────────────────────────────────
+    # Three heading variants ("Size Chart" / "Lower Body Garment Chart" /
+    # "Full Body Chart") followed by a plain <table>. Values are inch ranges.
+    "tuckdemo.myshopify.com": {
+        "name": "Tuck Demo",
+        "container": r'<h2[^>]*class="page-title"[^>]*>[^<]*Chart[^<]*</h2>.*?<table>(.*?)</table>',
+        "row": r"<tr>(.*?)</tr>",
+        "cell": r"<t[dh][^>]*>(.*?)</t[dh]>",
+        "parse": "regex",
+        "first_row": "headers",
+        "value_format": "plain",
+        "unit": "inches",
+    },
+
     # ── FableStreet ───────────────────────────────────────────────────
     # Next.js embedded JSON with escaped quotes. Cells are objects with in/cm keys.
     "fablestreet.com": {

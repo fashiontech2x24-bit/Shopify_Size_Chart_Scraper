@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
-from .config import OUTPUT_DIR, MAX_PARALLEL, BROWSER_ARGS
+from .config import OUTPUT_DIR, MAX_PARALLEL
 from .helpers import launch_browser
 from .regex_scan import try_regex_scan
 from .stores import STORE_SCRAPERS
@@ -26,51 +26,64 @@ from .shopify_api import try_shopify_api
 log = logging.getLogger(__name__)
 
 
+# Exact-host store map. Matched against host == domain or host.endswith("." + domain)
+_STORE_MAP = {
+    "snitch.co.in": "snitch",
+    "snitch.com": "snitch",
+    "fashionnova.com": "fashionnova",
+    "libas.in": "libas",
+    "thehouseofrare.com": "rarerabbit",
+    "gymshark.com": "gymshark",
+    "bombayshirts.com": "bombayshirts",
+    "theloom.in": "theloom",
+    "outdoorvoices.com": "outdoorvoices",
+    "goodamerican.com": "goodamerican",
+}
+
+
 def detect_store(url: str) -> str:
-    """Detect known store from URL hostname."""
-    host = urlparse(url).netloc.lower()
-    store_map = {
-        "snitch.co.in": "snitch",
-        "snitch.com": "snitch",
-        "fashionnova.com": "fashionnova",
-        "libas.in": "libas",
-        "thehouseofrare.com": "rarerabbit",
-        "gymshark.com": "gymshark",
-        "bombayshirts.com": "bombayshirts",
-        "theloom.in": "theloom",
-        "outdoorvoices.com": "outdoorvoices",
-        "goodamerican.com": "goodamerican",
-        "geneslecoanethemant.com": "geneslecoanethemant",
-    }
-    for domain, store in store_map.items():
-        if domain in host:
+    """Detect known store from URL hostname (exact host or subdomain match)."""
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    for domain, store in _STORE_MAP.items():
+        if host == domain or host.endswith("." + domain):
             return store
     return "unknown"
 
 
-async def scrape_url(url: str, browser=None, recipe: dict | None = None, skip_browser: bool = False) -> pd.DataFrame:
+async def scrape_url(
+    url: str,
+    browser=None,
+    recipe: dict | None = None,
+    skip_browser: bool = False,
+    storefront_password: str | None = None,
+) -> pd.DataFrame:
     """
     Scrape size chart from any product URL.
 
-    1. If URL matches a known store → use optimized store-specific scraper
-    2. Otherwise → use universal scraper
-    3. If universal fails → try Shopify API fallback
+    Layer 0: Regex/JSON recipe (no browser) — instant if recipe supplied/known.
+    Layer 1: Known store scraper (browser).
+    Layer 2: Universal scraper (browser).
+    Layer 3: Shopify API fallback (HTTP).
 
     Returns a DataFrame with columns: Product, Unit, Size, + measurements.
     """
     store = detect_store(url)
 
     # Layer 0: Regex fast-scan (no browser, instant)
-    # Works for stores that have a recipe in recipes.py
+    # When caller supplies a recipe explicitly, trust it (confidence gating disabled).
     try:
-        df, confidence = await try_regex_scan(url, recipe=recipe)
-        if not df.empty and confidence >= 0.5:
-            log.info("Regex scan succeeded (confidence: %.2f) — %s", confidence, url)
-            return df
-        elif not df.empty:
-            log.info("Regex scan low confidence (%.2f), trying browser...", confidence)
+        df, confidence = await try_regex_scan(url, recipe=recipe, storefront_password=storefront_password)
+        if not df.empty:
+            # If the caller provided an inline recipe, don't second-guess it.
+            if recipe is not None:
+                log.info("[recipe] Inline recipe succeeded (confidence: %.2f) — %s", confidence, url)
+                return df
+            if confidence >= 0.5:
+                log.info("[recipe] Stored recipe succeeded (confidence: %.2f) — %s", confidence, url)
+                return df
+            log.info("[recipe] Low confidence (%.2f), falling through...", confidence)
     except Exception as e:
-        log.debug("Regex scan skipped: %s", e)
+        log.debug("[recipe] Skipped: %s", e)
 
     # If caller wants recipe-only mode, stop here
     if skip_browser:
@@ -105,7 +118,7 @@ async def scrape_url(url: str, browser=None, recipe: dict | None = None, skip_br
     # Layer 3: Shopify API fallback
     if "/products/" in url:
         try:
-            df, confidence = await try_shopify_api(url, browser=browser)
+            df, confidence = await try_shopify_api(url)
             if not df.empty:
                 log.info("Shopify API fallback succeeded (confidence: %.2f)", confidence)
                 return df

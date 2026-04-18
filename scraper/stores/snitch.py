@@ -5,7 +5,6 @@ an internal API when the "Size Chart" modal opens. We intercept that API
 response for reliable structured data, with DOM text parsing as fallback.
 """
 
-import json
 import pandas as pd
 from ..config import INCH_TO_CM
 from ..helpers import _wait_for, launch_browser, create_stealth_context

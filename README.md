@@ -54,6 +54,7 @@ curl -X POST http://localhost:8000/scrape \
 | `recipe` | object | No | `null` | Inline recipe for Layer 0 extraction. If omitted, falls back to stored recipes then browser layers |
 | `skip_browser` | boolean | No | `false` | If `true`, skip browser layers (1/2/3) when recipe fails — returns instantly |
 | `store_name` | string | No | auto-detected | Store name for logging and response `store` field |
+| `storefront_password` | string | No | `null` | Shopify storefront password — when set, the service POSTs it to `<origin>/password` before fetching, enabling password-protected preview stores at Layer 0 |
 
 #### Recipe Object Fields
 
@@ -339,7 +340,7 @@ Response:
 }
 ```
 
-**Timeout (60s):**
+**Timeout (configurable via `SCRAPE_TIMEOUT`, default 60s):**
 ```json
 {
   "success": false,
@@ -364,9 +365,17 @@ Requests flow through 4 layers in order. The first layer that returns data wins.
 | 0 — Recipe | HTTP fetch + recipe engine | ~0.3 sec | Inline recipe provided OR domain matches `scraper/recipes.py` |
 | 1 — Known Store | Browser + custom scraper | ~5-15 sec | Store has a scraper in `scraper/stores/` |
 | 2 — Universal | Browser + auto-detection | ~5-15 sec | Any unknown store |
-| 3 — Shopify API | API call | ~1 sec | URL contains `/products/` |
+| 3 — Shopify API | HTTP (no browser) | ~0.5 sec | URL contains `/products/` |
 
 If `skip_browser: true` is set, layers 1/2/3 are skipped entirely.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCRAPE_TIMEOUT` | `60` | Per-request scrape timeout (seconds) |
+| `API_KEY` | _(unset)_ | If set, `POST /scrape` requires header `X-API-Key: <value>` |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated list of CORS origins (e.g. `https://admin.example.com`) |
 
 ---
 
