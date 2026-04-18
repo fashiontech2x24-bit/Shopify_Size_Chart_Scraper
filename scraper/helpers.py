@@ -1,7 +1,36 @@
 """Shared helper functions used by both store-specific and universal scrapers."""
 
 import re
-from .config import INCH_TO_CM
+from .config import HEADERS, INCH_TO_CM, BROWSER_ARGS
+
+
+async def launch_browser():
+    """Launch a stealth Chromium browser with anti-bot args."""
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=BROWSER_ARGS)
+    return pw, browser
+
+
+async def create_stealth_context(browser, locale="en-US"):
+    """Create a browser context with anti-bot stealth settings."""
+    ctx = await browser.new_context(
+        user_agent=HEADERS["User-Agent"],
+        viewport={"width": 1920, "height": 1080},
+        locale=locale,
+    )
+    await ctx.add_init_script(
+        'Object.defineProperty(navigator, "webdriver", { get: () => false });'
+    )
+    return ctx
+
+
+async def cleanup_browser(page, ctx, pw):
+    """Close page, context, and optionally playwright instance."""
+    await page.close()
+    await ctx.close()
+    if pw:
+        await pw.stop()
 
 
 async def _wait_for(page, js_condition: str, timeout: int = 8000, interval: int = 400):
@@ -77,11 +106,29 @@ def _inch_range_to_cm(val: str):
 async def get_product_title(page, url: str, brand_name: str = "") -> str:
     """Extract product title from page, with brand name cleanup."""
     title = await page.evaluate("""() => {
-        const el = document.querySelector('h1, [data-testid="product-title"], .product__title, [class*="product-title"], [class*="ProductTitle"]');
-        if (el) return el.textContent.trim();
-        let t = document.title || '';
-        return t.trim();
+        const selectors = [
+            '[data-testid="product-title"]',
+            '.product__title',
+            '[class*="product-title"]',
+            '[class*="ProductTitle"]',
+            'h1',
+        ];
+        for (const sel of selectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                if (el.offsetParent !== null && el.innerText.trim().length > 0) {
+                    return el.innerText.trim();
+                }
+            }
+        }
+        // Fallback: first h1 even if hidden, then document.title
+        const h1 = document.querySelector('h1');
+        if (h1 && h1.textContent.trim()) return h1.textContent.trim();
+        return (document.title || '').trim();
     }""")
+
+    # Collapse internal whitespace/newlines from textContent
+    if title:
+        title = re.sub(r'\s+', ' ', title).strip()
 
     if title and brand_name:
         # Clean brand name from title

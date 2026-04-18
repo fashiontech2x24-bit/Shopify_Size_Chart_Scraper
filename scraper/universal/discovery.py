@@ -9,7 +9,7 @@ Strategies (tried in order):
   5. Iframe detection — Kiwi Sizing and similar embedded widgets
 """
 
-from ..helpers import _wait_for, _click_and_wait
+from ..helpers import _wait_for
 
 # JS: find all clickable elements whose text matches size chart keywords
 FIND_TRIGGERS_JS = """() => {
@@ -114,10 +114,10 @@ FIND_BY_ATTRS_JS = """() => {
     const candidates = [];
 
     for (const el of document.querySelectorAll('*')) {
-        const attrs = (el.className || '') + ' ' + (el.id || '');
+        let attrs = (el.className || '') + ' ' + (el.id || '');
         for (const attr of el.attributes) {
             if (attr.name.startsWith('data-')) {
-                attrs + ' ' + attr.value;
+                attrs += ' ' + attr.value;
             }
         }
         const lower = attrs.toLowerCase();

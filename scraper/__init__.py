@@ -9,6 +9,7 @@ Usage:
 """
 
 import asyncio
+import logging
 import os
 import sys
 from urllib.parse import urlparse
@@ -16,85 +17,121 @@ from urllib.parse import urlparse
 import pandas as pd
 
 from .config import OUTPUT_DIR, MAX_PARALLEL
+from .helpers import launch_browser
+from .regex_scan import try_regex_scan
 from .stores import STORE_SCRAPERS
 from .universal.pipeline import scrape_universal
 from .shopify_api import try_shopify_api
 
+log = logging.getLogger(__name__)
+
+
+# Exact-host store map. Matched against host == domain or host.endswith("." + domain)
+_STORE_MAP = {
+    "snitch.co.in": "snitch",
+    "snitch.com": "snitch",
+    "fashionnova.com": "fashionnova",
+    "libas.in": "libas",
+    "thehouseofrare.com": "rarerabbit",
+    "gymshark.com": "gymshark",
+    "bombayshirts.com": "bombayshirts",
+    "theloom.in": "theloom",
+    "outdoorvoices.com": "outdoorvoices",
+    "goodamerican.com": "goodamerican",
+}
+
 
 def detect_store(url: str) -> str:
-    """Detect known store from URL hostname."""
-    host = urlparse(url).netloc.lower()
-    store_map = {
-        "snitch.com": "snitch",
-        "fashionnova.com": "fashionnova",
-        "libas.in": "libas",
-        "thehouseofrare.com": "rarerabbit",
-        "gymshark.com": "gymshark",
-        "bombayshirts.com": "bombayshirts",
-        "theloom.in": "theloom",
-        "outdoorvoices.com": "outdoorvoices",
-        "goodamerican.com": "goodamerican",
-    }
-    for domain, store in store_map.items():
-        if domain in host:
+    """Detect known store from URL hostname (exact host or subdomain match)."""
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    for domain, store in _STORE_MAP.items():
+        if host == domain or host.endswith("." + domain):
             return store
     return "unknown"
 
 
-async def scrape_url(url: str, browser=None) -> pd.DataFrame:
+async def scrape_url(
+    url: str,
+    browser=None,
+    recipe: dict | None = None,
+    skip_browser: bool = False,
+    storefront_password: str | None = None,
+) -> pd.DataFrame:
     """
     Scrape size chart from any product URL.
 
-    1. If URL matches a known store → use optimized store-specific scraper
-    2. Otherwise → use universal scraper
-    3. If universal fails → try Shopify API fallback
+    Layer 0: Regex/JSON recipe (no browser) — instant if recipe supplied/known.
+    Layer 1: Known store scraper (browser).
+    Layer 2: Universal scraper (browser).
+    Layer 3: Shopify API fallback (HTTP).
 
     Returns a DataFrame with columns: Product, Unit, Size, + measurements.
     """
     store = detect_store(url)
 
+    # Layer 0: Regex fast-scan (no browser, instant)
+    # When caller supplies a recipe explicitly, trust it (confidence gating disabled).
+    try:
+        df, confidence = await try_regex_scan(url, recipe=recipe, storefront_password=storefront_password)
+        if not df.empty:
+            # If the caller provided an inline recipe, don't second-guess it.
+            if recipe is not None:
+                log.info("[recipe] Inline recipe succeeded (confidence: %.2f) — %s", confidence, url)
+                return df
+            if confidence >= 0.5:
+                log.info("[recipe] Stored recipe succeeded (confidence: %.2f) — %s", confidence, url)
+                return df
+            log.info("[recipe] Low confidence (%.2f), falling through...", confidence)
+    except Exception as e:
+        log.debug("[recipe] Skipped: %s", e)
+
+    # If caller wants recipe-only mode, stop here
+    if skip_browser:
+        log.info("skip_browser=True — not falling through to browser layers")
+        return pd.DataFrame()
+
     # Layer 1: Known store scraper
     if store in STORE_SCRAPERS:
-        print(f"\nStore: {store.upper()} (known)")
-        print(f"URL:   {url}")
+        log.info("Store: %s (known) — %s", store.upper(), url)
         try:
             df = await STORE_SCRAPERS[store](url, browser=browser)
             if not df.empty:
                 return df
-            print(f"  Known scraper returned empty, falling through to universal...")
+            log.info("Known scraper returned empty, falling through to universal...")
         except Exception as e:
-            print(f"  Known scraper failed: {e}, falling through to universal...")
+            log.warning("Known scraper failed: %s, falling through to universal...", e)
 
     # Layer 2: Universal scraper
-    print(f"\nStore: UNIVERSAL")
-    print(f"URL:   {url}")
+    log.info("Store: UNIVERSAL — %s", url)
     try:
         df, confidence = await scrape_universal(url, browser=browser)
         if not df.empty and confidence >= 0.3:
-            print(f"  Universal scraper succeeded (confidence: {confidence})")
+            log.info("Universal scraper succeeded (confidence: %.2f)", confidence)
             return df
         elif not df.empty:
-            print(f"  Universal scraper low confidence ({confidence}), trying Shopify API...")
+            log.info("Universal scraper low confidence (%.2f), trying Shopify API...", confidence)
         else:
-            print(f"  Universal scraper found nothing, trying Shopify API...")
+            log.info("Universal scraper found nothing, trying Shopify API...")
     except Exception as e:
-        print(f"  Universal scraper failed: {e}, trying Shopify API...")
+        log.warning("Universal scraper failed: %s, trying Shopify API...", e)
 
     # Layer 3: Shopify API fallback
     if "/products/" in url:
         try:
-            df, confidence = await try_shopify_api(url, browser=browser)
+            df, confidence = await try_shopify_api(url)
             if not df.empty:
-                print(f"  Shopify API fallback succeeded (confidence: {confidence})")
+                log.info("Shopify API fallback succeeded (confidence: %.2f)", confidence)
                 return df
         except Exception as e:
-            print(f"  Shopify API fallback failed: {e}")
+            log.warning("Shopify API fallback failed: %s", e)
 
-    print(f"  No size chart data found.")
+    log.info("No size chart data found for %s", url)
     return pd.DataFrame()
 
 
 async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     if len(sys.argv) < 2:
         print("Usage: python -m scraper <url1> [url2] [url3] ...")
         sys.exit(1)
@@ -102,14 +139,8 @@ async def main():
     urls = sys.argv[1:]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
-
+    pw, browser = await launch_browser()
+    try:
         if len(urls) == 1:
             results = [await scrape_url(urls[0], browser=browser)]
         else:
@@ -123,22 +154,22 @@ async def main():
                 *[bounded_scrape(url) for url in urls],
                 return_exceptions=True,
             )
-
+    finally:
         await browser.close()
+        await pw.stop()
 
     all_dfs = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"\n  ERROR scraping {urls[i]}: {result}\n")
+            log.error("ERROR scraping %s: %s", urls[i], result)
             continue
-        df = result
-        if df.empty:
-            print("  No size chart data found.\n")
+        if result.empty:
+            log.info("No size chart data found for %s", urls[i])
             continue
 
-        all_dfs.append(df)
-        print(f"\n  Size Chart ({len(df)} sizes, all measurements in CM):\n")
-        print(df.to_string(index=False))
+        all_dfs.append(result)
+        print(f"\n  Size Chart ({len(result)} sizes, all measurements in CM):\n")
+        print(result.to_string(index=False))
         print()
 
     if all_dfs:
